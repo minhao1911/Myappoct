@@ -3,11 +3,14 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
+import { GeoLocation, Zmanim, HDate, HebrewCalendar, Sedra, Location } from '@hebcal/core';
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
+// Gemini model: see https://ai.google.dev/gemini-api/docs/models (gemini-3.8-flash = current stable Flash, Oct 2026)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -180,7 +183,7 @@ app.post('/api/airabbi/ask', async (req, res) => {
 
       return res.json({
         answer,
-        model: 'gemini-3.5-flash (Simulated Fallback)',
+        model: `${GEMINI_MODEL} (Simulated Fallback)`,
         isSimulated: true
       });
     }
@@ -188,7 +191,7 @@ app.post('/api/airabbi/ask', async (req, res) => {
     const fullPrompt = `${BNEI_MENASHE_SYSTEM_PROMPT}\n\nLanguage requested: ${language}\nMode: ${mode}\nContext: ${context}\n\nUser Question/Request: ${prompt}`;
 
     const response = await client.models.generateContent({
-      model: 'gemini-3.5-flash',
+      model: GEMINI_MODEL,
       contents: fullPrompt,
     });
 
@@ -200,7 +203,7 @@ app.post('/api/airabbi/ask', async (req, res) => {
 
     return res.json({
       answer: generatedText,
-      model: 'gemini-3.5-flash',
+      model: GEMINI_MODEL,
       isSimulated: false
     });
   } catch (error: any) {
@@ -212,55 +215,93 @@ app.post('/api/airabbi/ask', async (req, res) => {
   }
 });
 
-// 2. Zmanim & Astronomical Calculation Endpoint
+// 2. Zmanim & Astronomical Calculation Endpoint (real calculation via @hebcal/core)
+const ZMANIM_PRESETS: Record<string, { lat: number; lng: number; tz: string; name: string; elevation: number }> = {
+  'Churachandpur, Manipur': { lat: 24.3333, lng: 93.6833, tz: 'Asia/Kolkata', name: 'Churachandpur, Manipur (India)', elevation: 914 },
+  'Aizawl, Mizoram': { lat: 23.7271, lng: 92.7176, tz: 'Asia/Kolkata', name: 'Aizawl, Mizoram (India)', elevation: 1132 },
+  'Imphal, Manipur': { lat: 24.8170, lng: 93.9368, tz: 'Asia/Kolkata', name: 'Imphal, Manipur (India)', elevation: 786 },
+  'Jerusalem, Israel': { lat: 31.7683, lng: 35.2137, tz: 'Asia/Jerusalem', name: 'Jerusalem, Israel', elevation: 754 },
+  'Nof HaGalil, Israel': { lat: 32.7056, lng: 35.3314, tz: 'Asia/Jerusalem', name: 'Nof HaGalil, Israel', elevation: 450 },
+  'New York, USA': { lat: 40.7128, lng: -74.0060, tz: 'America/New_York', name: 'New York, USA', elevation: 10 }
+};
+
 app.get('/api/zmanim', (req, res) => {
-  const location = (req.query.location as string) || 'Churachandpur, Manipur';
-  const now = new Date();
-  
-  // Base coordinates mapping for key Bnei Menashe centers
-  const locationOffsets: Record<string, { lat: number; lng: number; tz: string; name: string }> = {
-    'Churachandpur, Manipur': { lat: 24.3333, lng: 93.6833, tz: 'IST (UTC+5:30)', name: 'Churachandpur, Manipur (India)' },
-    'Aizawl, Mizoram': { lat: 23.7271, lng: 92.7176, tz: 'IST (UTC+5:30)', name: 'Aizawl, Mizoram (India)' },
-    'Imphal, Manipur': { lat: 24.8170, lng: 93.9368, tz: 'IST (UTC+5:30)', name: 'Imphal, Manipur (India)' },
-    'Jerusalem, Israel': { lat: 31.7683, lng: 35.2137, tz: 'IDT (UTC+3:00)', name: 'Jerusalem, Israel' },
-    'Nof HaGalil, Israel': { lat: 32.7056, lng: 35.3314, tz: 'IDT (UTC+3:00)', name: 'Nof HaGalil, Israel' },
-    'New York, USA': { lat: 40.7128, lng: -74.0060, tz: 'EDT (UTC-4:00)', name: 'New York, USA' }
-  };
+  const q = req.query as Record<string, string | undefined>;
+  const preset = ZMANIM_PRESETS[q.location || ''] || (q.lat || q.lng ? undefined : ZMANIM_PRESETS['Churachandpur, Manipur']);
+  if (q.location && !ZMANIM_PRESETS[q.location] && !(q.lat && q.lng)) {
+    return res.status(400).json({ error: `Unknown location. Use one of: ${Object.keys(ZMANIM_PRESETS).join('; ')} or pass lat & lng.` });
+  }
+  const num = (v: string | undefined) => (v === undefined || v.trim() === '' ? undefined : Number(v));
+  const lat = num(q.lat) ?? preset?.lat;
+  const lng = num(q.lng) ?? preset?.lng;
+  const elevation = num(q.elevation) ?? preset?.elevation ?? 0;
+  const tz = q.tz || preset?.tz || 'UTC';
+  if (lat === undefined || lng === undefined || !Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return res.status(400).json({ error: 'lat must be in [-90,90] and lng in [-180,180].' });
+  }
+  if (!Number.isFinite(elevation) || elevation < -500 || elevation > 9000) {
+    return res.status(400).json({ error: 'elevation must be meters in [-500, 9000].' });
+  }
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch {
+    return res.status(400).json({ error: `Invalid IANA timezone: ${tz}` });
+  }
+  let date: Date;
+  if (q.date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(q.date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD.' });
+    const [y, m, d] = q.date.split('-').map(Number);
+    date = new Date(y, m - 1, d, 12);
+    if (date.getMonth() !== m - 1 || date.getDate() !== d) return res.status(400).json({ error: 'Invalid calendar date.' });
+  } else {
+    const [y, m, d] = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date()).split('-').map(Number);
+    date = new Date(y, m - 1, d, 12);
+  }
 
-  const locInfo = locationOffsets[location] || locationOffsets['Churachandpur, Manipur'];
+  try {
+    const name = preset && !q.lat ? preset.name : `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+    const gloc = new GeoLocation(name, lat, lng, elevation, tz);
+    const z = new Zmanim(gloc, date, elevation > 0);
+    const fmt = (t: Date) => (t && !isNaN(t.getTime()) ? t.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }) : null);
+    const sunset = z.sunset();
+    const candle = new Date(sunset.getTime() - 18 * 60000);
+    const nightfall = z.tzeit(8.5);
+    const times: Record<string, Date> = {
+      alotHashachar: z.alotHaShachar(), tallitTefillin: z.misheyakir(), sunrise: z.sunrise(),
+      sofZmanShema: z.sofZmanShma(), sofZmanTefillah: z.sofZmanTfilla(), chatzot: z.chatzot(),
+      minchaGedolah: z.minchaGedola(), minchaKetana: z.minchaKetana(), plagHamincha: z.plagHaMincha(),
+      sunset, nightfall, candleLighting: candle, havdalah: nightfall
+    };
+    const zmanim: Record<string, string | null> = {};
+    for (const [k, v] of Object.entries(times)) zmanim[k] = fmt(v);
 
-  // Simulated accurate schedule with natural offsets
-  res.json({
-    location: locInfo.name,
-    timezone: locInfo.tz,
-    coordinates: `${locInfo.lat.toFixed(4)}° N, ${locInfo.lng.toFixed(4)}° E`,
-    hebrewDate: '16th of Tamuz, 5786',
-    gregorianDate: now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
-    parashah: 'Parashat Pinchas',
-    dafYomi: 'Chullin 54',
-    omerCount: null, // Tamuz is after Omer
-    moonPhase: 'Waning Gibbous (92% Illumination)',
-    zmanim: {
-      alotHashachar: '3:48 AM',
-      tallitTefillin: '4:12 AM',
-      sunrise: '4:31 AM',
-      sofZmanShema: '8:42 AM',
-      sofZmanTefillah: '9:58 AM',
-      chatzot: '11:39 AM',
-      minchaGedolah: '12:15 PM',
-      minchaKetana: '4:45 PM',
-      plagHamincha: '5:18 PM',
-      sunset: '6:08 PM',
-      nightfall: '6:50 PM',
-      candleLighting: '5:50 PM',
-      havdalah: '6:50 PM'
-    },
-    nextEvent: {
-      name: 'Sunset (Shkiah)',
-      time: '6:08 PM',
-      countdownSeconds: 14200
-    }
-  });
+    const hd = new HDate(date);
+    const il = tz === 'Asia/Jerusalem';
+    const parsha = new Sedra(hd.getFullYear(), il).lookup(hd);
+    const daf = HebrewCalendar.calendar({ start: hd, end: hd, dailyLearning: { dafYomi: true }, noHolidays: true, location: Location.lookup('Jerusalem') || undefined })
+      .find(e => e.getDesc && e.getDesc().includes('Daf'));
+    const omerDay = (() => { const start = new HDate(16, 'Nisan', hd.getFullYear()).abs(); const n = hd.abs() - start + 1; return n >= 1 && n <= 49 ? n : null; })();
+    const offMin = (() => { const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'longOffset' }).formatToParts(date).find(x => x.type === 'timeZoneName'); return p?.value || tz; })();
+
+    const now = new Date();
+    const upcoming = Object.entries({ 'Sunrise (Netz)': times.sunrise, 'Chatzot': times.chatzot, 'Sunset (Shkiah)': sunset, 'Nightfall (Tzeit)': nightfall })
+      .filter(([, t]) => t && t.getTime() > now.getTime()).sort((a, b) => a[1].getTime() - b[1].getTime())[0];
+
+    res.json({
+      location: name,
+      timezone: `${tz} (${offMin.replace('GMT', 'UTC')})`,
+      coordinates: `${Math.abs(lat).toFixed(4)}° ${lat >= 0 ? 'N' : 'S'}, ${Math.abs(lng).toFixed(4)}° ${lng >= 0 ? 'E' : 'W'}`,
+      elevation,
+      hebrewDate: hd.render('en'),
+      gregorianDate: date.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
+      parashah: parsha.chag ? 'Holiday reading' : `Parashat ${parsha.parsha.join('-')}`,
+      dafYomi: daf ? daf.render('en').replace(/^Daf Yomi:\s*/, '') : null,
+      omerCount: omerDay,
+      zmanim,
+      nextEvent: upcoming ? { name: upcoming[0], time: fmt(upcoming[1]), countdownSeconds: Math.round((upcoming[1].getTime() - now.getTime()) / 1000) } : null,
+      method: 'Hebcal Zmanim (GRA shaot zmaniyot; alot 16.1°, misheyakir 11.5°, tzeit 8.5°, candles 18 min)'
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Zmanim calculation failed.' });
+  }
 });
 
 // 3. SaaS Enterprise Analytics Endpoint
